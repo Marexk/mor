@@ -1,0 +1,111 @@
+name: Compilar Parches Morphe (Desde Codigo Fuente)
+
+on:
+  workflow_dispatch: # Permite ejecutarlo manualmente con un boton en la pestaña Actions
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  build-mpp:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Descargar el codigo de tu repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Java JDK 17 y cache de Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: 3. Ejecutar pruebas unitarias y compilar libpvhook.so desde C++ (Prime Video)
+        run: |
+          cd experimental/primevideo-libignite-native/jni
+          
+          # Prueba unitaria del filtro en C++ antes de compilar
+          g++ -std=c++17 test_remote_strip.cpp remote_strip.cpp -o test_runner
+          ./test_runner
+          rm -f test_runner
+
+          # Compilar para 32-bit (armeabi-v7a) y 64-bit (arm64-v8a) con el NDK oficial
+          cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-23 -B build-v7a
+          cmake --build build-v7a
+
+          cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -B build-arm64
+          cmake --build build-arm64
+
+          # Reemplazar los binarios en resources por los recien compilados
+          mkdir -p ../../../patches/src/main/resources/native/armeabi-v7a
+          mkdir -p ../../../patches/src/main/resources/native/arm64-v8a
+          cp -f build-v7a/libpvhook.so ../../../patches/src/main/resources/native/armeabi-v7a/libpvhook.so
+          cp -f build-arm64/libpvhook.so ../../../patches/src/main/resources/native/arm64-v8a/libpvhook.so
+          rm -rf build-v7a build-arm64
+
+      - name: 4. Descargar frida-gadget limpio desde el repo oficial de Frida (Netflix)
+        run: |
+          GADGET_DIR="patches/src/main/resources/netflix/native/armeabi-v7a"
+          mkdir -p "$GADGET_DIR"
+
+          # Descargar motor principal (17.9.1) y motor legacy (16.2.1) directo de Frida oficial
+          curl -fsSL "https://github.com/frida/frida/releases/download/17.9.1/frida-gadget-17.9.1-android-arm.so.xz" | xz -d > "$GADGET_DIR/libgadget.so"
+          curl -fsSL "https://github.com/frida/frida/releases/download/16.2.1/frida-gadget-16.2.1-android-arm.so.xz" | xz -d > "$GADGET_DIR/libgadget-16.2.1.so"
+
+          # Verificar hash SHA-256 oficial documentado para 16.2.1
+          echo "55cd05fb08be602c6eaf5467d310a31a9f9bac0ddc8dabbe434284ebf83c60ae  $GADGET_DIR/libgadget-16.2.1.so" | sha256sum -c -
+
+      - name: 5. Compilar el paquete .mpp y generar lista de parches
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x gradlew
+          ./gradlew clean :patches:buildAndroid :patches:generatePatchesList
+
+      - name: 6. Subir el archivo .mpp como Artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: morphe-patches-mpp
+          path: |
+            patches/build/libs/*.mpp
+            patches-list.json
+
+      - name: 7. Publicar Release en tu GitHub y actualizar patches-bundle.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep '^version *=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          MPP_FILE="patches/build/libs/patches-${VERSION}.mpp"
+          TAG="v${VERSION}"
+
+          # Crear o actualizar el Release en tu propio repositorio con tu .mpp compilado
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$MPP_FILE" --clobber
+          else
+            gh release create "$TAG" "$MPP_FILE" \
+              --title "Release $TAG (Compilacion Propia Verificada)" \
+              --notes "Paquete .mpp y librerias nativas compiladas integramente desde el codigo fuente en GitHub Actions."
+          fi
+
+          # Actualizar patches-bundle.json para que apunte a tu propio repositorio
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%S")
+          cat <<EOF > patches-bundle.json
+          {
+            "created_at": "${NOW}",
+            "description": "Compilacion propia verificada (${TAG})",
+            "download_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/patches-${VERSION}.mpp",
+            "signature_download_url": "",
+            "version": "${VERSION}"
+          }
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add patches-bundle.json patches-list.json
+          git diff --staged --quiet || git commit -m "chore: actualizar patches-bundle.json con compilacion propia ${TAG}"
+          git push
